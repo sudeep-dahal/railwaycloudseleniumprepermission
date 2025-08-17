@@ -8,18 +8,21 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
+from dotenv import load_dotenv
 
 # -------------------------
-# CONFIG
+# Load environment variables from .env
 # -------------------------
+load_dotenv()
+
 BASE_URL = 'https://dofe.gov.np/'
 START_LOT_NUMER = 48363817
 END_LOT_NUMBER = 48363820
 
-# AWS S3 config (set in Railway environment variables)
-S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "your-bucket-name")
+# AWS S3 config
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
 S3_FILE_KEY = os.getenv("S3_FILE_KEY", "scraped-data/final_permission_selenium_scraped.csv")
-AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
+AWS_REGION = os.getenv("AWS_REGION")
 
 
 class ForeignJobs:
@@ -105,7 +108,12 @@ class ForeignJobs:
     def upload_to_s3(self, file_path):
         """Uploads the CSV to AWS S3"""
         try:
-            s3 = boto3.client("s3", region_name=AWS_REGION)
+            s3 = boto3.client(
+                "s3",
+                region_name=AWS_REGION,
+                aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+            )
             s3.upload_file(file_path, S3_BUCKET_NAME, S3_FILE_KEY)
             print(f"✅ File uploaded to S3 bucket '{S3_BUCKET_NAME}' at '{S3_FILE_KEY}'")
         except Exception as e:
