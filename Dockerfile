@@ -1,36 +1,31 @@
-FROM python:3.12-slim
+FROM python:3.11-slim
 
-# Install dependencies
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
-    wget \
-    curl \
-    unzip \
     chromium \
     chromium-driver \
-    libnss3 \
-    libx11-6 \
-    libasound2 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libxss1 \
-    libgconf-2-4 \
-    libxtst6 \
+    wget \
+    unzip \
     fonts-liberation \
+    libnss3 \
+    libasound2 \
+    libxss1 \
     libappindicator3-1 \
+    libatk-bridge2.0-0 \
+    libgtk-3-0 \
+    libgbm1 \
     xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Set display port to avoid crash
-ENV DISPLAY=:99
+# Set env vars so Selenium knows where Chromium is
+ENV CHROME_BIN=/usr/bin/chromium
+ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
 
-# Install python requirements
-COPY requirements.txt /app/requirements.txt
+# Copy files
 WORKDIR /app
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
 
-# Copy project files
-COPY . /app
-
-# Run app
+# Run main.py
 CMD ["python", "main.py"]
