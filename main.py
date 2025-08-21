@@ -1,142 +1,147 @@
+import csv
 import os
 import time
 import logging
-import boto3
-import pandas as pd
-from dotenv import load_dotenv
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.common.exceptions import StaleElementReferenceException, TimeoutException, NoSuchElementException
+import boto3
+from dotenv import load_dotenv
 
 # -------------------------
 # Load environment variables
 # -------------------------
 load_dotenv()
-
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_REGION")
-BUCKET = os.getenv("S3_BUCKET_NAME")
-START_LOT = int(os.getenv("START_LOT", 48156969))
-END_LOT = int(os.getenv("END_LOT", 48156975))
-
-# Check required environment variables
-if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, BUCKET]):
-    raise ValueError("❌ Missing required AWS S3 environment variables!")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+S3_FILE_KEY = os.getenv("S3_FILE_KEY", "scraped-data/final_permission_selenium_scraped.csv")
 
 # -------------------------
-# Logging
+# Logging config
 # -------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-# -------------------------
-# Initialize boto3 S3 client
-# -------------------------
-s3 = boto3.client(
-    "s3",
-    aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    region_name=AWS_REGION
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
 
 # -------------------------
-# Selenium driver
+# Scraping Config
 # -------------------------
-def init_driver():
-    chrome_options = Options()
-    chrome_options.add_argument("--headless=new")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=1920,1080")
+BASE_URL = 'https://dofe.gov.np/'
+START_LOT_NUMER = 48363817
+END_LOT_NUMBER = 48363820
+CSV_FILE = "final_permission_selenium_scraped.csv"
 
-    service = Service("/usr/bin/chromedriver")  # adjust path if needed
-    driver = webdriver.Chrome(service=service, options=chrome_options)
-    return driver
+CSV_HEADERS = [
+    "Going Through", "Name", "Gender", "PassportNo", "Company",
+    "Country", "ApprovedDate", "StickerNo", "Skill", "Contract Period (in years)",
+    "Salary", "Insurance", "Policy No.", "Policy Expiry Date", "Medical", "SSFId", "SubmissionNo"
+]
 
-# -------------------------
-# Scrape single lot
-# -------------------------
-def scrape_lot(lot_number):
-    driver = init_driver()
-    driver.get("https://dofe.gov.np/PassportDetail.aspx")
-    data = {
-        "LotNo": lot_number,
-        "Name": "N/A",
-        "Passport": "N/A",
-        "Country": "N/A"
-    }
 
-    try:
-        # Input Lot number
-        lot_input = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.ID, "lytA_ctl23_Stickertext"))
-        )
-        lot_input.clear()
-        lot_input.send_keys(f"{lot_number:09d}")
+class ForeignJobs:
+    def __init__(self):
+        options = Options()
+        options.add_argument("--headless=new")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-software-rasterizer")
+        options.add_argument("--window-size=1920,1080")
+        self.driver = webdriver.Chrome(options=options)
 
-        # Click search
-        driver.find_element(By.ID, "lytA_ctl23_passportSearch").click()
-        time.sleep(5)
+    def land_first_page(self):
+        logging.info("🌐 Opening website...")
+        self.driver.get(BASE_URL)
+        time.sleep(2)
 
-        # Scrape data
-        name_elem = driver.find_element(By.ID, "lblName")
-        passport_elem = driver.find_element(By.ID, "lblPassportNo")
-        country_elem = driver.find_element(By.ID, "lblCountry")
+    def scrape_lots(self):
+        table_data = []
+        for i in range(START_LOT_NUMER, END_LOT_NUMBER):
+            lot_value = f"{i:09d}"
+            logging.info(f"🔍 Scraping lot {lot_value}...")
+            details = {}
 
-        data["Name"] = name_elem.text.strip()
-        data["Passport"] = passport_elem.text.strip()
-        data["Country"] = country_elem.text.strip()
+            try:
+                lot_input = self.driver.find_element(By.ID, "lytA_ctl23_Stickertext")
+                lot_input.clear()
+                lot_input.send_keys(lot_value)
+                self.driver.find_element(By.ID, "lytA_ctl23_passportSearch").click()
 
-        logger.info(f"✅ Scraped lot {lot_number}: {data}")
+                # Wait for table to appear
+                WebDriverWait(self.driver, 20).until(
+                    EC.presence_of_element_located((By.XPATH, '//*[@id="PassportMainshowTable"]/table'))
+                )
 
-    except (TimeoutException, NoSuchElementException) as e:
-        logger.warning(f"⚠️ Error scraping lot {lot_number}: {e}")
-    except Exception as e:
-        logger.error(f"❌ Unexpected error for lot {lot_number}: {e}")
-    finally:
-        driver.quit()
+                details_table = self.driver.find_element(By.XPATH, '//*[@id="PassportMainshowTable"]/table')
+                for tr in details_table.find_elements(By.XPATH, './/tr'):
+                    row = [td.text for td in tr.find_elements(By.XPATH, './/td')]
+                    if len(row) >= 2:
+                        details[row[0]] = row[1]
 
-    return data
+                if details:
+                    table_data.append(details)
+                    logging.info(f"✅ Data scraped for lot {lot_value}")
+                else:
+                    logging.warning(f"⚠️ No data found for lot {lot_value}")
 
-# -------------------------
-# Save CSV and upload to S3
-# -------------------------
-def save_to_s3(df, filename):
-    df.to_csv(filename, index=False)
-    logger.info(f"💾 CSV saved locally as {filename}")
+            except (StaleElementReferenceException, TimeoutException, NoSuchElementException) as e:
+                logging.warning(f"⚠️ Error scraping lot {lot_value}: {e}")
+            except Exception as e:
+                logging.error(f"❌ Unexpected error for lot {lot_value}: {e}")
 
-    try:
-        s3.upload_file(filename, BUCKET, filename)
-        logger.info(f"✅ Uploaded {filename} to S3 bucket {BUCKET}")
-    except Exception as e:
-        logger.error(f"❌ Failed to upload CSV to S3: {e}")
+            # Sleep 10 seconds between each lot
+            time.sleep(10)
 
-# -------------------------
-# Main
-# -------------------------
-def main():
-    results = []
-    for lot in range(START_LOT, END_LOT + 1):
-        logger.info(f"🔍 Scraping lot {lot}...")
-        data = scrape_lot(lot)
-        results.append(data)
-        time.sleep(10)  # 10-second delay between requests
+        return table_data
 
-    if results:
-        df = pd.DataFrame(results)
-        filename = f"scraped_{START_LOT}_{END_LOT}.csv"
-        save_to_s3(df, filename)
-    else:
-        logger.warning("⚠️ No data scraped.")
+    def save_csv(self, data):
+        if not data:
+            logging.warning("⚠️ No data scraped, CSV will not be saved.")
+            return
+
+        file_exists = os.path.isfile(CSV_FILE)
+        try:
+            with open(CSV_FILE, "a", newline="", encoding="utf-8") as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=CSV_HEADERS)
+                if not file_exists:
+                    writer.writeheader()
+                for row in data:
+                    writer.writerow({key: row.get(key, "") for key in CSV_HEADERS})
+            logging.info(f"💾 CSV saved locally as {CSV_FILE}")
+        except Exception as e:
+            logging.error(f"❌ Error writing CSV: {e}")
+
+    def upload_to_s3(self):
+        try:
+            s3 = boto3.client(
+                "s3",
+                aws_access_key_id=AWS_ACCESS_KEY_ID,
+                aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+                region_name=AWS_REGION
+            )
+            s3.upload_file(CSV_FILE, S3_BUCKET_NAME, S3_FILE_KEY)
+            logging.info(f"✅ File uploaded to S3 bucket '{S3_BUCKET_NAME}' at '{S3_FILE_KEY}'")
+        except Exception as e:
+            logging.error(f"❌ Failed to upload file to S3: {e}")
+
+    def quit_driver(self):
+        self.driver.quit()
+        logging.info("🛑 WebDriver closed.")
+
 
 if __name__ == "__main__":
-    main()
+    fj = ForeignJobs()
+    try:
+        fj.land_first_page()
+        data = fj.scrape_lots()
+        fj.save_csv(data)
+        fj.upload_to_s3()
+    finally:
+        fj.quit_driver()
