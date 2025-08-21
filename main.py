@@ -1,94 +1,96 @@
 import os
 import time
-import boto3
 import pandas as pd
+import boto3
+import logging
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from dotenv import load_dotenv
 
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
-class ForeignJobs:
-    def __init__(self):
-        options = Options()
-        options.add_argument("--headless=new")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1920,1080")
+# Load environment variables
+load_dotenv()
 
-        # Explicitly set Chromium and chromedriver paths
-        options.binary_location = "/usr/bin/chromium"
-        service = Service("/usr/bin/chromedriver")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = os.getenv("AWS_REGION")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
 
-        self.driver = webdriver.Chrome(service=service, options=options)
+if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_BUCKET_NAME]):
+    raise ValueError("❌ Missing one or more required AWS environment variables.")
 
-    def scrape_lot(self, lot_no: int) -> dict:
-        """Scrape data from the given lot number"""
-        url = f"https://dofe.gov.np/PassportDetail.aspx?lot={lot_no}"
-        self.driver.get(url)
-        time.sleep(2)
+def init_driver():
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    driver = webdriver.Chrome(options=options)
+    return driver
 
-        try:
-            name = self.driver.find_element(By.ID, "lblName").text.strip()
-            passport = self.driver.find_element(By.ID, "lblPassport").text.strip()
-            status = self.driver.find_element(By.ID, "lblStatus").text.strip()
-        except Exception:
-            name, passport, status = "", "", "Not Found"
+def scrape_lot(lot_number):
+    url = f"https://dofe.gov.np/PassportDetail.aspx?lot={lot_number}"
+    driver = init_driver()
+    driver.get(url)
 
-        return {"Lot": lot_no, "Name": name, "Passport": passport, "Status": status}
+    try:
+        data = {
+            "lot_number": lot_number,
+            "name": driver.find_element(By.ID, "lblName").text,
+            "passport_number": driver.find_element(By.ID, "lblPassportNo").text,
+            "status": driver.find_element(By.ID, "lblStatus").text,
+        }
+        logger.info(f"Scraped lot {lot_number} successfully")
+    except Exception as e:
+        logger.warning(f"Error scraping lot {lot_number}: {e}")
+        data = None
+    finally:
+        driver.quit()
 
-    def quit(self):
-        self.driver.quit()
+    return data
 
+def save_to_s3(df, filename):
+    if not S3_BUCKET_NAME:
+        raise ValueError("❌ Environment variable S3_BUCKET_NAME is not set!")
 
-def save_to_s3(df: pd.DataFrame, filename: str):
-    """Save DataFrame to S3 as CSV"""
-    bucket = os.getenv("S3_BUCKET_NAME")
+    df.to_csv(filename, index=False)
 
     s3 = boto3.client(
         "s3",
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-        region_name=os.getenv("AWS_REGION"),
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=AWS_REGION,
     )
+    s3.upload_file(filename, S3_BUCKET_NAME, filename)
 
-    # Save locally first
-    df.to_csv(filename, index=False)
-
-    # Upload to S3
-    s3.upload_file(filename, bucket, filename)
-    print(f"✅ Uploaded {filename} to S3 bucket {bucket}")
-
+    logger.info(f"✅ Uploaded {filename} to s3://{S3_BUCKET_NAME}/{filename}")
 
 def main():
-    start_lot = int(os.getenv("START_LOT", "48156965"))
-    end_lot = int(os.getenv("END_LOT", "48156975"))
+    start_lot = 48156965
+    end_lot = 48156970  # change as needed
 
-    fj = ForeignJobs()
-    all_data = []
-
+    results = []
     for lot in range(start_lot, end_lot + 1):
-        print(f"Scraping lot {lot}...")
-        data = fj.scrape_lot(lot)
-        all_data.append(data)
-        time.sleep(10)  # be polite
+        logger.info(f"🔍 Scraping lot {lot}...")
+        data = scrape_lot(lot)
+        if data:
+            results.append(data)
+        time.sleep(10)  # respect rate limits
 
-        # batch every 5 lots
-        if len(all_data) % 5 == 0:
-            df = pd.DataFrame(all_data)
-            filename = f"lots_{lot-4}_to_{lot}.csv"
-            save_to_s3(df, filename)
-            all_data = []
-
-    # remaining
-    if all_data:
-        df = pd.DataFrame(all_data)
-        filename = f"lots_{end_lot-len(all_data)+1}_to_{end_lot}.csv"
+    if results:
+        df = pd.DataFrame(results)
+        filename = f"lots_{start_lot}_{end_lot}.csv"
         save_to_s3(df, filename)
-
-    fj.quit()
-
+    else:
+        logger.warning("⚠️ No data scraped.")
 
 if __name__ == "__main__":
     main()
