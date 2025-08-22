@@ -1,124 +1,146 @@
 import os
 import time
-import csv
 import logging
+import pandas as pd
 import boto3
-from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
-from webdriver_manager.core.utils import get_browser_version_from_os
 
-# ================== LOGGING ==================
+# -----------------------------------------------------------------------------
+# Logging setup
+# -----------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-# ================== AWS CONFIG ==================
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_REGION = os.getenv("AWS_REGION", "eu-north-1")
-S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
-
-s3_client = boto3.client(
-    "s3",
-    aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    region_name=AWS_REGION,
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-# ================== SELENIUM SETUP ==================
+# -----------------------------------------------------------------------------
+# Create Chrome driver
+# -----------------------------------------------------------------------------
 def create_driver():
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.binary_location = "/usr/bin/chromium"  # Railway chromium path
 
-    # Auto-detect correct Chromium version
-    browser_version = (
-        get_browser_version_from_os("google-chrome")
-        or get_browser_version_from_os("chromium")
+    driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager(version="139.0.0").install()),
+        options=chrome_options
     )
-    logger.info(f"Detected browser version: {browser_version}")
+    return driver
 
-    driver_path = ChromeDriverManager(version=browser_version).install()
-    logger.info(f"Using ChromeDriver: {driver_path}")
-
-    return webdriver.Chrome(service=Service(driver_path), options=chrome_options)
-
-
-# ================== SCRAPER FUNCTION ==================
-def scrape_lot(lot_number):
-    url = f"https://dofe.gov.np/PassportDetail.aspx?lot={lot_number}"
-    logger.info(f"Scraping lot number: {lot_number} from {url}")
+# -----------------------------------------------------------------------------
+# Scrape single passport detail
+# -----------------------------------------------------------------------------
+def scrape_passport(driver, lot_number):
+    url = "https://dofe.gov.np/PassportDetail.aspx"
     driver.get(url)
 
-    # Example scraping (you should adjust selectors as per actual site)
     try:
-        element = driver.find_element("id", "ctl00_ContentPlaceHolder1_lblPassportNo")
-        passport_no = element.text.strip()
+        # Fill lot number
+        input_box = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.ID, "ctl00_ContentPlaceHolder1_txtLot"))
+        )
+        input_box.clear()
+        input_box.send_keys(str(lot_number))
+
+        # Click search button
+        search_btn = driver.find_element(By.ID, "ctl00_ContentPlaceHolder1_btnSearch")
+        search_btn.click()
+
+        # Wait for table to load
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.ID, "ctl00_ContentPlaceHolder1_gvPassport"))
+        )
+
+        rows = driver.find_elements(By.XPATH, "//table[@id='ctl00_ContentPlaceHolder1_gvPassport']/tbody/tr")
+
+        results = []
+        for row in rows:
+            cols = row.find_elements(By.TAG_NAME, "td")
+            if len(cols) > 1:
+                results.append({
+                    "lot_number": lot_number,
+                    "passport_no": cols[0].text.strip(),
+                    "name": cols[1].text.strip(),
+                    "status": cols[2].text.strip()
+                })
+
+        logging.info(f"Scraped lot {lot_number}, found {len(results)} records")
+        return results
+
     except Exception as e:
-        logger.warning(f"No data found for lot {lot_number}: {e}")
-        passport_no = None
+        logging.error(f"Error scraping lot {lot_number}: {e}")
+        return []
 
-    return {"lot_number": lot_number, "passport_no": passport_no}
+# -----------------------------------------------------------------------------
+# Save dataframe to S3
+# -----------------------------------------------------------------------------
+def save_to_s3(df, filename):
+    bucket = os.getenv("AWS_BUCKET_NAME")
+    if not bucket:
+        raise ValueError("AWS_BUCKET_NAME environment variable is not set!")
 
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+    )
 
-# ================== SAVE TO CSV ==================
-def save_to_csv(data, filename):
-    keys = data[0].keys()
-    with open(filename, "w", newline="", encoding="utf-8") as output_file:
-        writer = csv.DictWriter(output_file, fieldnames=keys)
-        writer.writeheader()
-        writer.writerows(data)
+    df.to_csv(filename, index=False, encoding="utf-8-sig")
+    logging.info(f"Uploading {filename} to S3 bucket {bucket}")
+    s3.upload_file(filename, bucket, filename)
+    logging.info("Upload complete")
 
-
-# ================== UPLOAD TO S3 ==================
-def upload_to_s3(file_path, bucket_name, object_name):
-    try:
-        s3_client.upload_file(file_path, bucket_name, object_name)
-        logger.info(f"Uploaded {file_path} to s3://{bucket_name}/{object_name}")
-    except Exception as e:
-        logger.error(f"Error uploading file to S3: {e}")
-
-
-# ================== MAIN ==================
-if __name__ == "__main__":
+# -----------------------------------------------------------------------------
+# Main logic
+# -----------------------------------------------------------------------------
+def main():
     driver = create_driver()
+    start_lot = int(os.getenv("START_LOT", "48156965"))
+    end_lot = int(os.getenv("END_LOT", "48156995"))
+    batch_size = 5
 
-    start_lot = 48156965
-    end_lot = 48156975  # Example range
-    results = []
+    all_results = []
+    file_index = 1
 
-    for lot in range(start_lot, end_lot + 1):
-        try:
-            result = scrape_lot(lot)
-            if result["passport_no"]:
-                results.append(result)
-        except Exception as e:
-            logger.error(f"Error scraping lot {lot}: {e}")
+    try:
+        for lot in range(start_lot, end_lot + 1):
+            results = scrape_passport(driver, lot)
+            all_results.extend(results)
 
-        # Wait 20 seconds between requests
-        logger.info("Sleeping for 20 seconds before next request...")
-        time.sleep(20)
+            # Wait 20 seconds between requests
+            time.sleep(20)
 
-        # Save & upload every 5 records
-        if len(results) >= 5:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"lot_data_{timestamp}.csv"
-            save_to_csv(results, filename)
-            upload_to_s3(filename, S3_BUCKET_NAME, filename)
-            results.clear()
+            # Save in batches of 5
+            if len(all_results) >= batch_size:
+                df = pd.DataFrame(all_results)
+                filename = f"passport_batch_{file_index}.csv"
+                save_to_s3(df, filename)
+                all_results = []
+                file_index += 1
 
-    # Save remaining results if any
-    if results:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"lot_data_{timestamp}.csv"
-        save_to_csv(results, filename)
-        upload_to_s3(filename, S3_BUCKET_NAME, filename)
+        # Save any remaining records
+        if all_results:
+            df = pd.DataFrame(all_results)
+            filename = f"passport_batch_{file_index}.csv"
+            save_to_s3(df, filename)
 
-    driver.quit()
-    logger.info("Scraping completed.")
+    finally:
+        driver.quit()
+        logging.info("Closed browser")
+
+# -----------------------------------------------------------------------------
+# Run
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    main()
