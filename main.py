@@ -6,8 +6,6 @@ import boto3
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 import chromedriver_autoinstaller
 
 # Setup logging
@@ -34,53 +32,20 @@ def create_driver():
     driver = webdriver.Chrome(options=chrome_options)
     return driver
 
-def get_passport_number(driver):
-    """
-    Dynamically attempts multiple selectors to find passport number.
-    """
-    selectors = [
-        "#ctl00_ContentPlaceHolder1_lblPassportNo",
-        "#ctl00_ContentPlaceHolder1_lblAlternatePassportNo",
-        "//span[contains(@id,'lblPassport')]",
-        "//span[contains(text(),'Passport')]/following-sibling::span",
-        "//td[contains(text(),'Passport Number')]/following-sibling::td"
-    ]
-    for sel in selectors:
-        try:
-            if sel.startswith("//"):
-                element = WebDriverWait(driver, 15).until(
-                    EC.presence_of_element_located((By.XPATH, sel))
-                )
-            else:
-                element = WebDriverWait(driver, 15).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, sel))
-                )
-            if element:
-                return element.text.strip()
-        except:
-            continue
-    return None
-
 def scrape_lot(driver, lot):
     url = f"https://dofe.gov.np/PassportDetail.aspx?lot={lot}"
     logging.info(f"🔍 Scraping lot {lot} -> {url}")
     driver.get(url)
+    time.sleep(5)  # wait for page to load
 
-    # Ensure page loaded
     try:
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
-    except:
-        logging.warning(f"⚠️ Page did not load properly for lot {lot}")
-        return None
-
-    passport_no = get_passport_number(driver)
-    if passport_no:
+        passport_no_elem = driver.find_element(By.ID, "ctl00_ContentPlaceHolder1_lblPassportNo")
+        passport_no = passport_no_elem.text.strip()
         logging.info(f"✅ Found passport number for lot {lot}: {passport_no}")
-    else:
+        return {"lot": lot, "passport_no": passport_no}
+    except:
         logging.warning(f"⚠️ Element not found for lot {lot}")
-    return {"lot": lot, "passport_no": passport_no or ""}
+        return {"lot": lot, "passport_no": ""}
 
 def save_to_csv(data, filename="final_permission_selenium_scraped.csv"):
     keys = data[0].keys() if data else ["lot", "passport_no"]
@@ -99,7 +64,7 @@ def upload_to_s3(file_path):
 def main():
     driver = create_driver()
 
-    # Configurable lot range
+    # Configurable lot range via environment variables
     start_lot = int(os.environ.get("START_LOT", 48156967))
     end_lot = int(os.environ.get("END_LOT", 48156970))
 
@@ -107,8 +72,7 @@ def main():
     for lot in range(start_lot, end_lot + 1):
         try:
             data = scrape_lot(driver, lot)
-            if data:
-                scraped_data.append(data)
+            scraped_data.append(data)
         except Exception as e:
             logging.warning(f"⚠️ Error scraping lot {lot}: {e}")
         logging.info("⏱ Sleeping 20 seconds before next request...")
