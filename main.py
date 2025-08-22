@@ -1,73 +1,58 @@
 import time
 import csv
-import os
 import logging
+import os
+import boto3
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import chromedriver_autoinstaller
-import boto3
 
-# ===== Setup logging =====
+# Setup logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
 )
 
-# ===== AWS S3 Setup =====
+# Ensure chromedriver is installed and matches current Chrome
+chromedriver_autoinstaller.install()
+
+# AWS S3 config (replace with your bucket details)
 S3_BUCKET = "finalapproval-csv-uploads"
-S3_PATH = "scraped-data/final_permission_selenium_scraped.csv"
+S3_KEY_PREFIX = "scraped-data/final_permission_selenium_scraped.csv"
 
-s3_client = boto3.client(
-    's3',
-    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
-)
-
-# ===== Scraper settings =====
-BASE_URL = "https://dofe.gov.np/PassportDetail.aspx?lot={lot}"
-WAIT_BETWEEN_REQUESTS = 20  # seconds
-MAX_RETRIES = 3
-
-# ===== CSV file =====
-CSV_FILE = "final_permission_selenium_scraped.csv"
-CSV_FIELDS = ["lot_number", "passport_number"]
-
-# ===== Create Chrome driver =====
 def create_driver():
-    chromedriver_autoinstaller.install()  # auto install chromedriver
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    driver = webdriver.Chrome(options=options)
-    driver.set_window_size(1920, 1080)
+    chrome_options = Options()
+    chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1080")
+    driver = webdriver.Chrome(options=chrome_options)
     return driver
 
-# ===== Dynamic element detection =====
 def get_passport_number(driver):
     """
-    Tries multiple selectors to find the passport number dynamically.
-    Returns text if found, None otherwise.
+    Dynamically attempts multiple selectors to find passport number.
     """
     selectors = [
         "#ctl00_ContentPlaceHolder1_lblPassportNo",
         "#ctl00_ContentPlaceHolder1_lblAlternatePassportNo",
         "//span[contains(@id,'lblPassport')]",
-        "//span[contains(text(),'Passport')]/following-sibling::span"
+        "//span[contains(text(),'Passport')]/following-sibling::span",
+        "//td[contains(text(),'Passport Number')]/following-sibling::td"
     ]
-    element = None
     for sel in selectors:
         try:
             if sel.startswith("//"):
-                element = WebDriverWait(driver, 10).until(
+                element = WebDriverWait(driver, 15).until(
                     EC.presence_of_element_located((By.XPATH, sel))
                 )
             else:
-                element = WebDriverWait(driver, 10).until(
+                element = WebDriverWait(driver, 15).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, sel))
                 )
             if element:
@@ -76,64 +61,66 @@ def get_passport_number(driver):
             continue
     return None
 
-# ===== Scrape a single lot =====
 def scrape_lot(driver, lot):
-    url = BASE_URL.format(lot=lot)
+    url = f"https://dofe.gov.np/PassportDetail.aspx?lot={lot}"
     logging.info(f"🔍 Scraping lot {lot} -> {url}")
+    driver.get(url)
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            driver.get(url)
-            passport_number = get_passport_number(driver)
-            if passport_number:
-                logging.info(f"✅ Data scraped for lot {lot}: {passport_number}")
-                return {"lot_number": lot, "passport_number": passport_number}
-            else:
-                logging.warning(f"⚠️ Element not found for lot {lot}")
-                return {"lot_number": lot, "passport_number": ""}
-        except Exception as e:
-            logging.warning(f"⚠️ Attempt {attempt}/{MAX_RETRIES} failed for lot {lot}: {e}")
-            time.sleep(5)
-    logging.error(f"❌ Failed to scrape lot {lot} after {MAX_RETRIES} attempts")
-    return {"lot_number": lot, "passport_number": ""}
-
-# ===== Save CSV =====
-def save_csv(data):
-    file_exists = os.path.exists(CSV_FILE)
-    with open(CSV_FILE, mode='a', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        if not file_exists:
-            writer.writeheader()
-        for row in data:
-            writer.writerow(row)
-    logging.info(f"💾 CSV saved locally: {CSV_FILE}")
-
-# ===== Upload to S3 =====
-def upload_to_s3():
-    s3_client.upload_file(CSV_FILE, S3_BUCKET, S3_PATH)
-    logging.info(f"✅ File uploaded to S3: s3://{S3_BUCKET}/{S3_PATH}")
-
-# ===== Main scraper loop =====
-def main(start_lot=None, end_lot=None):
-    if start_lot is None:
-        start_lot = int(os.getenv("START_LOT", "48156967"))  # fallback if no input
-    if end_lot is None:
-        end_lot = int(os.getenv("END_LOT", str(start_lot + 10)))  # scrape 10 lots by default
-
-    driver = create_driver()
-    scraped_data = []
-
+    # Ensure page loaded
     try:
-        for lot in range(start_lot, end_lot + 1):
-            data = scrape_lot(driver, lot)
-            scraped_data.append(data)
-            logging.info(f"⏱ Sleeping {WAIT_BETWEEN_REQUESTS} seconds before next request...")
-            time.sleep(WAIT_BETWEEN_REQUESTS)
-    finally:
-        driver.quit()
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+    except:
+        logging.warning(f"⚠️ Page did not load properly for lot {lot}")
+        return None
 
-    save_csv(scraped_data)
-    upload_to_s3()
+    passport_no = get_passport_number(driver)
+    if passport_no:
+        logging.info(f"✅ Found passport number for lot {lot}: {passport_no}")
+    else:
+        logging.warning(f"⚠️ Element not found for lot {lot}")
+    return {"lot": lot, "passport_no": passport_no or ""}
+
+def save_to_csv(data, filename="final_permission_selenium_scraped.csv"):
+    keys = data[0].keys() if data else ["lot", "passport_no"]
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(data)
+    logging.info(f"💾 CSV saved locally: {filename}")
+    return filename
+
+def upload_to_s3(file_path):
+    s3_client = boto3.client("s3")
+    s3_client.upload_file(file_path, S3_BUCKET, S3_KEY_PREFIX)
+    logging.info(f"✅ File uploaded to S3: s3://{S3_BUCKET}/{S3_KEY_PREFIX}")
+
+def main():
+    driver = create_driver()
+
+    # Configurable lot range
+    start_lot = int(os.environ.get("START_LOT", 48156967))
+    end_lot = int(os.environ.get("END_LOT", 48156970))
+
+    scraped_data = []
+    for lot in range(start_lot, end_lot + 1):
+        try:
+            data = scrape_lot(driver, lot)
+            if data:
+                scraped_data.append(data)
+        except Exception as e:
+            logging.warning(f"⚠️ Error scraping lot {lot}: {e}")
+        logging.info("⏱ Sleeping 20 seconds before next request...")
+        time.sleep(20)
+
+    driver.quit()
+
+    if scraped_data:
+        csv_file = save_to_csv(scraped_data)
+        upload_to_s3(csv_file)
+    else:
+        logging.warning("⚠️ No data scraped.")
 
 if __name__ == "__main__":
     main()
