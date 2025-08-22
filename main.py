@@ -1,92 +1,111 @@
+import os
 import time
 import csv
 import logging
+import boto3
+import chromedriver_autoinstaller
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from webdriver_manager.chrome import ChromeDriverManager
 
-# Setup logging
+# ----------------- Logging -----------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()]
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-# Create Selenium driver
+# ----------------- Create Selenium Driver -----------------
 def create_driver():
-    logging.info("Initializing headless Chrome driver...")
+    logging.info("Checking ChromeDriver...")
+    chromedriver_autoinstaller.install()  # install driver matching installed Chrome
+
     chrome_options = Options()
-    chrome_options.add_argument("--headless=new")  # modern headless mode
+    chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_argument("--disable-gpu")
 
-    driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
-        options=chrome_options
-    )
+    driver = webdriver.Chrome(options=chrome_options)
     logging.info("Chrome driver started successfully.")
     return driver
 
-
-# Example scrape function
+# ----------------- Scrape Function -----------------
 def scrape_lot(lot_number, driver):
     url = f"https://dofe.gov.np/PassportDetail.aspx?lot={lot_number}"
-    logging.info(f"Fetching data for lot {lot_number} -> {url}")
-
+    logging.info(f"🔍 Scraping lot {lot_number} -> {url}")
     driver.get(url)
-    time.sleep(3)  # Let the page load
+    time.sleep(3)  # wait for page to load
 
     try:
         data_element = driver.find_element(By.ID, "ctl00_ContentPlaceHolder1_lblPassportNo")
         passport_no = data_element.text.strip()
-    except Exception:
+        logging.info(f"✅ Data scraped for lot {lot_number}")
+    except Exception as e:
         passport_no = "N/A"
+        logging.warning(f"⚠️ Error scraping lot {lot_number}: {e}")
 
-    logging.info(f"Lot {lot_number} -> Passport No: {passport_no}")
     return {"lot": lot_number, "passport_no": passport_no}
 
-
-# Save data to CSV
-def save_to_csv(data, filename="output.csv"):
-    logging.info(f"Saving {len(data)} records to {filename}...")
+# ----------------- Save CSV -----------------
+def save_to_csv(data, filename="final_permission_selenium_scraped.csv"):
+    logging.info(f"💾 Saving {len(data)} records to {filename}...")
     with open(filename, mode="a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["lot", "passport_no"])
-        if f.tell() == 0:  # Write header only if file is new
+        if f.tell() == 0:
             writer.writeheader()
         writer.writerows(data)
-    logging.info("Save completed.")
+    logging.info("CSV saved locally.")
 
+# ----------------- Upload to S3 -----------------
+def save_to_s3(filename):
+    bucket = os.environ.get("S3_BUCKET_NAME")
+    if not bucket:
+        logging.error("S3_BUCKET_NAME environment variable not set!")
+        return
 
-# Main function
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        region_name=os.environ.get("AWS_REGION")
+    )
+
+    s3_key = f"scraped-data/{filename}"
+    try:
+        s3.upload_file(filename, bucket, s3_key)
+        logging.info(f"✅ File uploaded to S3: s3://{bucket}/{s3_key}")
+    except Exception as e:
+        logging.error(f"❌ Failed to upload to S3: {e}")
+
+# ----------------- Main Function -----------------
 def main():
     driver = create_driver()
     start_lot = 48156965
     end_lot = 48156975
-
+    batch_size = 5
     results = []
+
     for lot in range(start_lot, end_lot + 1):
         data = scrape_lot(lot, driver)
         results.append(data)
 
-        # Save every 5 records
-        if len(results) >= 5:
+        if len(results) >= batch_size:
             save_to_csv(results)
+            save_to_s3("final_permission_selenium_scraped.csv")
             results = []
 
-        logging.info("Sleeping 20 seconds before next request...")
+        logging.info("⏱ Sleeping 20 seconds before next request...")
         time.sleep(20)
 
-    # Save remaining data
     if results:
         save_to_csv(results)
+        save_to_s3("final_permission_selenium_scraped.csv")
 
     driver.quit()
-    logging.info("Scraping completed successfully!")
+    logging.info("🏁 Scraping completed successfully!")
 
-
+# ----------------- Entry Point -----------------
 if __name__ == "__main__":
     main()
