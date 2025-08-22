@@ -1,106 +1,103 @@
-import time
+# from foreignJobs.foreignJobs import ForeignJobs 
+
 import csv
-import logging
 import os
-import boto3
-import chromedriver_autoinstaller
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
+from webdriver_manager.chrome import ChromeDriverManager
+import foreignJobs.constants as const
+import time
 
-# ---------------- Logging ---------------- #
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
 
-# ---------------- AWS S3 ---------------- #
-s3_client = boto3.client(
-    's3',
-    aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
-    region_name=os.environ.get('AWS_REGION', 'us-east-1')
-)
-S3_BUCKET = os.environ.get('S3_BUCKET', 'finalapproval-csv-uploads')
+BASE_URL = 'https://dofe.gov.np/'
+START_LOT_NUMER = 48363817
+END_LOT_NUMBER = 48363820
 
-# ---------------- WebDriver ---------------- #
-def create_driver():
-    # Install chromedriver matching local Chrome
-    chromedriver_autoinstaller.install()
-    
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless")  # remove if you want to see browser
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    
-    driver = webdriver.Chrome(options=options)
-    return driver
+class ForeignJobs:
+    def __init__(self):
+        try:
+            self.driver = webdriver.Chrome()
+        except Exception as e:
+            self.driver = webdriver.Chrome(ChromeDriverManager().install())
 
-# ---------------- Scraper ---------------- #
-def scrape_lot(driver, lot):
-    url = f"https://dofe.gov.np/PassportDetail.aspx?lot={lot}"
-    logging.info(f"🔍 Scraping lot {lot} -> {url}")
-    driver.get(url)
-    
-    try:
-        # Wait up to 15 seconds for the element to appear
-        elem = WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.ID, "ctl00_ContentPlaceHolder1_lblPassportNo"))
-        )
-        passport_no = elem.text.strip()
-        logging.info(f"✅ Found passport number for lot {lot}: {passport_no}")
-        return {"lot": lot, "passport_no": passport_no}
-    except:
-        logging.warning(f"⚠️ Element not found for lot {lot}")
-        return {"lot": lot, "passport_no": ""}
-
-def scrape_lot_with_retries(driver, lot, retries=3):
-    for attempt in range(1, retries + 1):
-        data = scrape_lot(driver, lot)
-        if data["passport_no"]:
-            return data
-        logging.info(f"🔁 Retry {attempt}/{retries} for lot {lot}")
+    def land_first_page(self):
+        self.driver.get(const.BASE_URL)
         time.sleep(5)
-    return {"lot": lot, "passport_no": ""}
 
-# ---------------- CSV ---------------- #
-def save_to_csv(data_list, filename="final_permission_selenium_scraped.csv"):
-    keys = data_list[0].keys() if data_list else ["lot", "passport_no"]
-    with open(filename, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
-        writer.writeheader()
-        writer.writerows(data_list)
-    logging.info(f"💾 CSV saved locally: {filename}")
-    return filename
+    def select_Lot_Number(self):
+        # Define CSV headers based on expected fields
+        csv_headers = [
+            "Going Through", "Name", "Gender", "PassportNo", "Company",
+            "Country", "ApprovedDate", "StickerNo", "Skill", "Contract Period (in years)",
+            "Salary", "Insurance", "Policy No.", "Policy Expiry Date", "Medical", "SSFId", "SubmissionNo"
+        ]
+        table_data = []
 
-def upload_to_s3(file_path):
-    s3_key = f"scraped-data/{os.path.basename(file_path)}"
-    s3_client.upload_file(file_path, S3_BUCKET, s3_key)
-    logging.info(f"✅ File uploaded to S3: s3://{S3_BUCKET}/{s3_key}")
+        try:
+            for i in range(const.START_LOT_NUMER, const.END_LOT_NUMBER):
+                details = {}  # Initialize details for each lot
+                value = f"{i:09d}"
+                try:
+                    # Locate elements
+                    lot_input = self.driver.find_element(By.ID, "lytA_ctl23_Stickertext")
+                    lot_input.clear()
+                    lot_input.send_keys(value)
 
-# ---------------- Main ---------------- #
-def main():
-    driver = create_driver()
-    
-    # Define start and end lot numbers here
-    start_lot = 48156967
-    end_lot = 48156970
-    
-    all_data = []
-    
-    for lot in range(start_lot, end_lot + 1):
-        data = scrape_lot_with_retries(driver, lot)
-        all_data.append(data)
-        logging.info("⏱ Sleeping 20 seconds before next request...")
-        time.sleep(20)
-    
-    driver.quit()
-    
-    csv_file = save_to_csv(all_data)
-    upload_to_s3(csv_file)
+                    self.driver.find_element(By.ID, "lytA_ctl23_passportSearch").click()
+                    time.sleep(5)  # Keep the requested sleep
 
-if __name__ == "__main__":
-    main()
+                    # Wait for the details table
+                    WebDriverWait(self.driver, 20).until(
+                        EC.presence_of_element_located((By.XPATH, '//*[@id="PassportMainshowTable"]/table'))
+                    )
+
+                    # Extract the "Details" section
+                    details_table = self.driver.find_element(By.XPATH, '//*[@id="PassportMainshowTable"]/table')
+                    for tr in details_table.find_elements(By.XPATH, './/tr'):
+                        row = [item.text for item in tr.find_elements(By.XPATH, './/td')]
+                        if len(row) >= 2:  # Ensure row has at least 2 columns
+                            details[row[0]] = row[1]
+
+                    if details:  # Only append if details were successfully scraped
+                        table_data.append(details)
+                        print(f"Scraped details for lot {value}: {details}")
+                        self.driver.find_element(By.ID, "passportSearch").click()
+                        time.sleep(10)
+                    else:
+                        print(f"No details found for lot {value}")
+
+                except (StaleElementReferenceException, TimeoutException) as e:
+                    print(f"Error scraping lot {value}: {e}")
+                    continue
+                except Exception as e:
+                    print(f"Unexpected error for lot {value}: {e}")
+                    continue
+
+        except Exception as e:
+            print(f"Exception occurred: {e}")
+            print(f"Error scraping at point: {i}")
+
+        finally:
+            # Write the data to CSV
+            csv_file = "final_permission_selenium_scraped.csv"
+            file_exists = os.path.isfile(csv_file)
+            try:
+                with open(csv_file, "a", newline="", encoding="utf-8") as csvfile:
+                    writer = csv.DictWriter(csvfile, fieldnames=csv_headers)
+                    if not file_exists:
+                        writer.writeheader()
+                    for row in table_data:
+                        # Write each row, filling missing fields with empty strings
+                        writer.writerow({key: row.get(key, "") for key in csv_headers})
+            except Exception as e:
+                print(f"Error writing to CSV: {e}")
+            finally:
+                self.driver.close()
+
+if __name__=='__main__':
+    fj = ForeignJobs()
+    fj.land_first_page()
+    fj.select_Lot_Number()
