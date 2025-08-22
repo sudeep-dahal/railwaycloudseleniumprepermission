@@ -30,6 +30,12 @@ if not S3_BUCKET:
 s3_client = boto3.client("s3")
 
 # =============================
+# Lot range setup (from env or default)
+# =============================
+START_LOT = int(os.getenv("START_LOT", 48156967))  # default start lot
+END_LOT = int(os.getenv("END_LOT", 48156970))      # default end lot
+
+# =============================
 # ChromeDriver setup
 # =============================
 chromedriver_autoinstaller.install()  # automatically installs matching chromedriver
@@ -83,16 +89,9 @@ def save_to_csv_and_s3(data, filename="final_permission_selenium_scraped.csv"):
 # =============================
 def main():
     driver = create_driver()
-    try:
-        start_lot = int(input("Enter start lot number: "))
-        end_lot = int(input("Enter end lot number: "))
-    except ValueError:
-        logging.error("Invalid lot number input!")
-        return
-
     scraped_data = []
 
-    for lot in range(start_lot, end_lot + 1):
+    for lot in range(START_LOT, END_LOT + 1):
         data = scrape_lot(lot, driver)
         scraped_data.append(data)
 
