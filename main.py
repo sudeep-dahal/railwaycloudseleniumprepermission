@@ -1,98 +1,124 @@
+import os
 import time
 import csv
 import logging
 import boto3
+from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.core.utils import get_browser_version_from_os
 
-# ---------------- Logging ---------------- #
+# ================== LOGGING ==================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ================== AWS CONFIG ==================
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = os.getenv("AWS_REGION", "eu-north-1")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+
+s3_client = boto3.client(
+    "s3",
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    region_name=AWS_REGION,
 )
 
-# ---------------- Selenium Setup ---------------- #
-chrome_options = Options()
-chrome_options.add_argument("--headless")
-chrome_options.add_argument("--disable-gpu")
-chrome_options.add_argument("--no-sandbox")
-chrome_options.add_argument("--disable-dev-shm-usage")
+# ================== SELENIUM SETUP ==================
+def create_driver():
+    chrome_options = Options()
+    chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
 
-driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+    # Auto-detect correct Chromium version
+    browser_version = (
+        get_browser_version_from_os("google-chrome")
+        or get_browser_version_from_os("chromium")
+    )
+    logger.info(f"Detected browser version: {browser_version}")
 
-# ---------------- Scraper ---------------- #
-def scrape_lot(lot, retries=2):
-    url = f"https://dofe.gov.np/PassportDetail.aspx?lot={lot}"
-    logging.info(f"🔍 Scraping lot {lot}...")
+    driver_path = ChromeDriverManager(version=browser_version).install()
+    logger.info(f"Using ChromeDriver: {driver_path}")
+
+    return webdriver.Chrome(service=Service(driver_path), options=chrome_options)
+
+
+# ================== SCRAPER FUNCTION ==================
+def scrape_lot(lot_number):
+    url = f"https://dofe.gov.np/PassportDetail.aspx?lot={lot_number}"
+    logger.info(f"Scraping lot number: {lot_number} from {url}")
     driver.get(url)
 
-    attempt = 0
-    while attempt <= retries:
-        try:
-            # Wait for an element to appear (adjust selector for your case!)
-            element = WebDriverWait(driver, 30).until(
-                EC.presence_of_element_located((By.ID, "ctl00_ContentPlaceHolder1_lblLot"))
-            )
+    # Example scraping (you should adjust selectors as per actual site)
+    try:
+        element = driver.find_element("id", "ctl00_ContentPlaceHolder1_lblPassportNo")
+        passport_no = element.text.strip()
+    except Exception as e:
+        logger.warning(f"No data found for lot {lot_number}: {e}")
+        passport_no = None
 
-            # Example: scrape multiple fields
-            lot_no = element.text.strip()
-            passport = driver.find_element(By.ID, "ctl00_ContentPlaceHolder1_lblPassportNo").text.strip()
-            name = driver.find_element(By.ID, "ctl00_ContentPlaceHolder1_lblName").text.strip()
+    return {"lot_number": lot_number, "passport_no": passport_no}
 
-            logging.info(f"✅ Data scraped for lot {lot}")
-            return {
-                "lot": lot_no,
-                "passport": passport,
-                "name": name
-            }
 
-        except Exception as e:
-            attempt += 1
-            if attempt > retries:
-                logging.warning(f"⚠️ Failed to scrape lot {lot} after {retries} retries: {e}")
-                return None
-            logging.info(f"🔁 Retry {attempt} for lot {lot} after 10s...")
-            time.sleep(10)
-
-# ---------------- Save to CSV ---------------- #
-def save_to_csv(data, filename="final_permission_selenium_scraped.csv"):
+# ================== SAVE TO CSV ==================
+def save_to_csv(data, filename):
     keys = data[0].keys()
-    with open(filename, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
+    with open(filename, "w", newline="", encoding="utf-8") as output_file:
+        writer = csv.DictWriter(output_file, fieldnames=keys)
         writer.writeheader()
         writer.writerows(data)
-    logging.info(f"💾 CSV saved locally: {filename}")
-    return filename
 
-# ---------------- Upload to S3 ---------------- #
-def upload_to_s3(filename, bucket_name="finalapproval-csv-uploads", key_prefix="scraped-data/"):
-    s3 = boto3.client("s3")
-    key = f"{key_prefix}{filename}"
-    s3.upload_file(filename, bucket_name, key)
-    logging.info(f"✅ File uploaded to S3: s3://{bucket_name}/{key}")
 
-# ---------------- Main ---------------- #
-def main():
-    start_lot = 48363817
-    end_lot = 48363825
-    scraped_data = []
+# ================== UPLOAD TO S3 ==================
+def upload_to_s3(file_path, bucket_name, object_name):
+    try:
+        s3_client.upload_file(file_path, bucket_name, object_name)
+        logger.info(f"Uploaded {file_path} to s3://{bucket_name}/{object_name}")
+    except Exception as e:
+        logger.error(f"Error uploading file to S3: {e}")
+
+
+# ================== MAIN ==================
+if __name__ == "__main__":
+    driver = create_driver()
+
+    start_lot = 48156965
+    end_lot = 48156975  # Example range
+    results = []
 
     for lot in range(start_lot, end_lot + 1):
-        data = scrape_lot(str(lot))
-        if data:
-            scraped_data.append(data)
-        time.sleep(20)  # polite delay between requests
+        try:
+            result = scrape_lot(lot)
+            if result["passport_no"]:
+                results.append(result)
+        except Exception as e:
+            logger.error(f"Error scraping lot {lot}: {e}")
 
-    if scraped_data:
-        filename = save_to_csv(scraped_data)
-        upload_to_s3(filename)
+        # Wait 20 seconds between requests
+        logger.info("Sleeping for 20 seconds before next request...")
+        time.sleep(20)
+
+        # Save & upload every 5 records
+        if len(results) >= 5:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"lot_data_{timestamp}.csv"
+            save_to_csv(results, filename)
+            upload_to_s3(filename, S3_BUCKET_NAME, filename)
+            results.clear()
+
+    # Save remaining results if any
+    if results:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"lot_data_{timestamp}.csv"
+        save_to_csv(results, filename)
+        upload_to_s3(filename, S3_BUCKET_NAME, filename)
 
     driver.quit()
-
-if __name__ == "__main__":
-    main()
+    logger.info("Scraping completed.")
